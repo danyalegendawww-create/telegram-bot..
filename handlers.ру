@@ -1,0 +1,334 @@
+import logging
+from aiogram import Router, F, Bot
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, CallbackQuery, PreCheckoutQuery
+from aiogram.exceptions import TelegramBadRequest
+
+from config import ADMIN_IDS
+from products import PRIVILEGES, UNBAN_PRICE, PURCHASE_TYPES
+from keyboards import get_main_keyboard, get_privileges_keyboard, get_cancel_keyboard
+from states import PurchaseStates
+from payments import send_invoice, process_pre_checkout, process_successful_payment
+from utils import get_moscow_time, validate_minecraft_nickname, format_admin_message
+from database import db
+
+router = Router()
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    """Обработчик команды /start"""
+    await state.clear()
+    await message.answer(
+        "👋 Приветствую в нашем боте!\n\n"
+        "🛒 Что хочешь купить?\n"
+        "Выбери опцию ниже:",
+        reply_markup=get_main_keyboard()
+    )
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    """Обработчик команды /help"""
+    await message.answer(
+        "📖 Помощь по боту:\n\n"
+        "🛡 /start - Главное меню\n"
+        "❌ /cancel - Отменить текущую операцию\n"
+        "💰 Покупки оплачиваются через Telegram Stars\n"
+        "👤 После оплаты нужно ввести ник в Minecraft\n"
+        "📨 Уведомление о покупке уходит администраторам"
+    )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    """Обработчик команды /cancel"""
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("🤔 Нет активных операций для отмены.")
+        return
+    
+    await state.clear()
+    await message.answer(
+        "✅ Операция отменена.\n"
+        "Вы можете начать заново с /start",
+        reply_markup=get_main_keyboard()
+    )
+
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery, state: FSMContext):
+    """Возврат в главное меню"""
+    await state.clear()
+    await callback.message.edit_text(
+        "👋 Приветствую в нашем боте!\n\n"
+        "🛒 Что хочешь купить?\n"
+        "Выбери опцию ниже:",
+        reply_markup=get_main_keyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "buy_privilege")
+async def show_privileges(callback: CallbackQuery):
+    """Показывает список привилегий"""
+    await callback.message.edit_text(
+        "🌟 Выбери привилегию:\n\n"
+        "Цены указаны в Telegram Stars ⭐",
+        reply_markup=get_privileges_keyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "buy_unban")
+async def buy_unban(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    """Покупка разбана"""
+    user_id = callback.from_user.id
+    username = callback.from_user.username or ""
+    
+    # Генерируем payload
+    import uuid
+    payload = str(uuid.uuid4())
+    
+    # Создаем заказ в БД
+    order_id = await db.create_order(
+        user_id=user_id,
+        username=username,
+        purchase_type="unban",
+        price=UNBAN_PRICE,
+        payload=payload,
+        product_name=None
+    )
+    
+    # Сохраняем данные в FSM
+    await state.update_data(
+        order_id=order_id,
+        purchase_type="unban",
+        item_type=PURCHASE_TYPES["unban"],
+        price=UNBAN_PRICE,
+        payload=payload
+    )
+    
+    # Отправляем счет
+    try:
+        await send_invoice(
+            bot=bot,
+            chat_id=user_id,
+            title="🔓 Разбан на сервере",
+            description="Разбан аккаунта на Minecraft сервере",
+            price=UNBAN_PRICE,
+            payload=payload
+        )
+        await callback.answer()
+    except Exception as e:
+        logging.error(f"Ошибка при создании счета: {e}")
+        await callback.answer("❌ Произошла ошибка при создании счета", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("priv_"))
+async def buy_privilege(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    """Покупка привилегии"""
+    privilege_name = callback.data.split("_")[1]
+    price = PRIVILEGES.get(privilege_name)
+    
+    if not price:
+        await callback.answer("❌ Привилегия не найдена", show_alert=True)
+        return
+    
+    user_id = callback.from_user.id
+    username = callback.from_user.username or ""
+    
+    # Генерируем payload
+    import uuid
+    payload = str(uuid.uuid4())
+    
+    # Создаем заказ в БД
+    order_id = await db.create_order(
+        user_id=user_id,
+        username=username,
+        purchase_type="privilege",
+        price=price,
+        payload=payload,
+        product_name=privilege_name
+    )
+    
+    # Сохраняем данные в FSM
+    await state.update_data(
+        order_id=order_id,
+        purchase_type="privilege",
+        privilege_name=privilege_name,
+        item_type=f"{PURCHASE_TYPES['privilege']}: {privilege_name}",
+        price=price,
+        payload=payload
+    )
+    
+    # Отправляем счет
+    try:
+        await send_invoice(
+            bot=bot,
+            chat_id=user_id,
+            title=f"🛡 Привилегия {privilege_name}",
+            description=f"Покупка привилегии {privilege_name} на Minecraft сервере",
+            price=price,
+            payload=payload
+        )
+        await callback.answer()
+    except Exception as e:
+        logging.error(f"Ошибка при создании счета: {e}")
+        await callback.answer("❌ Произошла ошибка при создании счета", show_alert=True)
+
+
+@router.pre_checkout_query()
+async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery, bot: Bot):
+    """Обработка предварительной проверки"""
+    await process_pre_checkout(pre_checkout_query, bot)
+
+
+@router.message(F.successful_payment)
+async def handle_successful_payment(message: Message, bot: Bot, state: FSMContext):
+    """Обработка успешного платежа"""
+    # Обрабатываем платеж с проверками
+    payment_data = await process_successful_payment(message)
+    
+    if not payment_data:
+        await message.answer("❌ Ошибка при обработке платежа. Пожалуйста, свяжитесь с администратором.")
+        return
+    
+    payload = payment_data["payload"]
+    payment_id = payment_data["payment_id"]
+    price = payment_data["price"]
+    
+    # Проверяем, не обработан ли уже этот платеж
+    existing_order = await db.get_order_by_payment_id(payment_id)
+    if existing_order:
+        logging.warning(f"⚠️ Платеж уже обработан: {payment_id}")
+        await message.answer(
+            "✅ Этот платеж уже был обработан.\n"
+            "Если у вас есть вопросы, обратитесь к администратору."
+        )
+        return
+    
+    # Получаем заказ по payload
+    order = await db.get_order_by_payload(payload)
+    if not order:
+        logging.warning(f"⚠️ Заказ не найден для payload: {payload}")
+        await message.answer(
+            "❌ Заказ не найден. Пожалуйста, свяжитесь с администратором."
+        )
+        return
+    
+    # Проверяем сумму
+    expected_price = order["price"]
+    if price != expected_price:
+        logging.warning(f"⚠️ Несоответствие суммы: ожидалось {expected_price}, получено {price}")
+        # Все равно обрабатываем, но логируем
+        await message.answer(
+            "⚠️ Сумма платежа не соответствует ожидаемой.\n"
+            "Обратитесь к администратору для уточнения."
+        )
+    
+    # Обновляем заказ в БД
+    await db.update_order_payment(order["order_id"], payment_id)
+    
+    # Получаем данные из FSM
+    user_data = await state.get_data()
+    item_type = user_data.get("item_type", order["purchase_type"])
+    
+    # Обновляем данные в FSM
+    await state.update_data(
+        payment_id=payment_id,
+        price=price,
+        timestamp=get_moscow_time()
+    )
+    
+    # Запрашиваем ник
+    await state.set_state(PurchaseStates.waiting_for_nickname)
+    await message.answer(
+        "✅ Оплата прошла успешно!\n\n"
+        "✏️ Теперь введи свой **ник в Minecraft**, чтобы мы могли выдать тебе покупку.\n"
+        "Просто напиши его в чат.",
+        reply_markup=get_cancel_keyboard()
+    )
+
+
+@router.message(StateFilter(PurchaseStates.waiting_for_nickname), F.text)
+async def handle_nickname(message: Message, bot: Bot, state: FSMContext):
+    """Обработка ввода ника Minecraft"""
+    user_id = message.from_user.id
+    nickname = message.text.strip()
+    
+    # Валидация ника
+    if not validate_minecraft_nickname(nickname):
+        await message.answer(
+            "❌ Неверный формат ника!\n"
+            "Ник должен содержать от 2 до 16 символов (буквы, цифры, подчеркивание).\n"
+            "Попробуйте еще раз:",
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+    
+    # Получаем данные из FSM
+    user_data = await state.get_data()
+    
+    if not user_data or "order_id" not in user_data:
+        await message.answer("❌ Данные о покупке не найдены. Начните заново с /start")
+        await state.clear()
+        return
+    
+    order_id = user_data["order_id"]
+    item_type = user_data.get("item_type", "Неизвестно")
+    price = user_data.get("price", 0)
+    time_str = user_data.get("timestamp", get_moscow_time())
+    payment_id = user_data.get("payment_id", "Неизвестно")
+    
+    # Обновляем заказ в БД
+    await db.update_order_nickname(order_id, nickname)
+    
+    # Отправляем уведомление администраторам
+    admin_message = format_admin_message(
+        username=message.from_user.username or "",
+        user_id=user_id,
+        nickname=nickname,
+        purchase_type=item_type,
+        price=price,
+        time_str=time_str,
+        payment_id=payment_id,
+        order_id=order_id
+    )
+    
+    # Отправляем всем администраторам
+    success_count = 0
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, admin_message, parse_mode="HTML")
+            success_count += 1
+        except Exception as e:
+            logging.error(f"❌ Не удалось отправить сообщение админу {admin_id}: {e}")
+    
+    if success_count == 0:
+        logging.error("❌ Не удалось отправить уведомление ни одному администратору")
+        await message.answer(
+            "⚠️ Произошла ошибка при отправке уведомления администраторам.\n"
+            "Пожалуйста, свяжитесь с администратором вручную."
+        )
+    else:
+        # Подтверждаем пользователю
+        await message.answer(
+            "✅ Отлично! Твой заказ отправлен администраторам.\n"
+            "Ожидай выдачи в ближайшее время. ⏳\n\n"
+            f"🆔 Номер заказа: {order_id}"
+        )
+    
+    # Очищаем состояние
+    await state.clear()
+
+
+@router.message()
+async def handle_other_messages(message: Message):
+    """Обработка всех остальных сообщений"""
+    await message.answer(
+        "🤔 Используй кнопки в меню или команду /start",
+        reply_markup=get_main_keyboard()
+    )
