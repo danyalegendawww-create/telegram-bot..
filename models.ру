@@ -1,0 +1,32 @@
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+
+@dataclass
+class Order:
+    """Модель заказа"""
+    id: int
+    order_id: str
+    user_id: int
+    username: Optional[str]
+    purchase_type: str
+    product_name: Optional[str]
+    price: int
+    currency: str
+    nickname: Optional[str]
+    status: str  # pending, paid, completed, cancelled
+    payment_id: Optional[str]
+    payload: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class PurchaseData:
+    """Данные о покупке для FSM"""
+    order_id: str
+    purchase_type: str
+    product_name: Optional[str]
+    price: int
+    payload: str
