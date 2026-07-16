@@ -1,0 +1,29 @@
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from products import PRIVILEGES
+
+
+def get_main_keyboard():
+    """Главное меню"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Купить привилегию", callback_data="buy_privilege")],
+        [InlineKeyboardButton(text="🔓 Заказать разбан", callback_data="buy_unban")],
+    ])
+
+
+def get_privileges_keyboard():
+    """Клавиатура со списком привилегий"""
+    buttons = []
+    for name, price in PRIVILEGES.items():
+        buttons.append([InlineKeyboardButton(
+            text=f"{name} - {price} ⭐",
+            callback_data=f"priv_{name}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_cancel_keyboard():
+    """Клавиатура с кнопкой отмены"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_purchase")]
+    ])
