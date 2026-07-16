@@ -1,0 +1,165 @@
+import sqlite3
+import json
+from datetime import datetime
+from typing import Optional, Dict, Any
+import aiosqlite
+from config import DATABASE_PATH
+
+
+class Database:
+    def __init__(self, db_path: str = DATABASE_PATH):
+        self.db_path = db_path
+
+    async def init_db(self):
+        """Инициализация базы данных"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id TEXT UNIQUE NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    purchase_type TEXT NOT NULL,
+                    product_name TEXT,
+                    price INTEGER NOT NULL,
+                    currency TEXT DEFAULT 'XTR',
+                    nickname TEXT,
+                    status TEXT DEFAULT 'pending',
+                    payment_id TEXT,
+                    payload TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)
+            """)
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)
+            """)
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id)
+            """)
+            await db.commit()
+
+    async def create_order(
+        self,
+        user_id: int,
+        username: str,
+        purchase_type: str,
+        price: int,
+        payload: str,
+        product_name: str = None,
+        currency: str = "XTR"
+    ) -> str:
+        """Создание нового заказа"""
+        import uuid
+        order_id = str(uuid.uuid4())[:8]
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO orders (
+                    order_id, user_id, username, purchase_type, 
+                    product_name, price, currency, payload, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                order_id, user_id, username, purchase_type,
+                product_name, price, currency, payload, 'pending'
+            ))
+            await db.commit()
+        
+        return order_id
+
+    async def update_order_payment(
+        self,
+        order_id: str,
+        payment_id: str,
+        status: str = 'paid'
+    ):
+        """Обновление заказа после оплаты"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE orders 
+                SET payment_id = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE order_id = ?
+            """, (payment_id, status, order_id))
+            await db.commit()
+
+    async def update_order_nickname(
+        self,
+        order_id: str,
+        nickname: str,
+        status: str = 'completed'
+    ):
+        """Обновление заказа после ввода ника"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE orders 
+                SET nickname = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE order_id = ?
+            """, (nickname, status, order_id))
+            await db.commit()
+
+    async def get_order_by_payload(self, payload: str) -> Optional[Dict[str, Any]]:
+        """Получение заказа по payload"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = sqlite3.Row
+            async with db.execute(
+                "SELECT * FROM orders WHERE payload = ?",
+                (payload,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_order_by_payment_id(self, payment_id: str) -> Optional[Dict[str, Any]]:
+        """Получение заказа по ID платежа (для защиты от дублей)"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = sqlite3.Row
+            async with db.execute(
+                "SELECT * FROM orders WHERE payment_id = ?",
+                (payment_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_pending_orders(self) -> list:
+        """Получение всех ожидающих заказов"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = sqlite3.Row
+            async with db.execute(
+                "SELECT * FROM orders WHERE status = 'paid' ORDER BY created_at DESC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_order_stats(self) -> Dict[str, Any]:
+        """Получение статистики по заказам"""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) as total, SUM(price) as total_revenue FROM orders WHERE status = 'completed'"
+            ) as cursor:
+                row = await cursor.fetchone()
+                total_orders = row[0] or 0
+                total_revenue = row[1] or 0
+            
+            async with db.execute(
+                "SELECT status, COUNT(*) as count FROM orders GROUP BY status"
+            ) as cursor:
+                status_counts = {}
+                async for row in cursor:
+                    status_counts[row[0]] = row[1]
+            
+            return {
+                "total_orders": total_orders,
+                "total_revenue": total_revenue,
+                "status_counts": status_counts
+            }
+
+    async def close(self):
+        """Закрытие соединения с БД"""
+        # aiosqlite автоматически закрывает соединения
+        pass
+
+
+# Глобальный экземпляр БД
+db = Database()
